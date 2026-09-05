@@ -98,7 +98,7 @@ dependencies {
     implementation("androidx.media3:media3-effect:$media3Version")
 
     // FFmpeg Kit for frame-accurate stream-copy & codec fallbacks
-    implementation("com.arthenica:ffmpeg-kit-full:6.0-2")
+    implementation("com.arthenica:ffmpeg-kit-full:6.0-2.LTS")
 
     // Background Processing with WorkManager & Coroutines
     implementation("androidx.work:work-runtime-ktx:2.10.0")

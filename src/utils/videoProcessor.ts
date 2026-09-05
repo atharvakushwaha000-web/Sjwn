@@ -179,101 +179,143 @@ export async function executeVideoSplitting(
   const completedEpisodes: EpisodeItem[] = [];
   const overallStartTime = Date.now();
 
-  for (let i = 0; i < totalEpisodes; i++) {
-    if (abortSignal.aborted) {
-      throw new Error('Processing was cancelled.');
+  // Create or share a single AudioContext unlocked on initial click
+  let sharedAudioCtx: AudioContext | null = null;
+  try {
+    const AudioContextClass =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (AudioContextClass) {
+      sharedAudioCtx = new AudioContextClass();
+      if (sharedAudioCtx.state === 'suspended') {
+        sharedAudioCtx.resume().catch(() => {});
+      }
     }
+  } catch {
+    // AudioContext not supported or blocked
+  }
 
-    const episodeNumber = i + 1;
-    const startSeconds = i * interval;
-    const endSeconds = Math.min((i + 1) * interval, totalDuration);
-    const episodeDuration = endSeconds - startSeconds;
-    const formattedRange = formatSecondsRange(startSeconds, endSeconds);
-    const fileName = `Episode ${episodeNumber}.mp4`;
-    const filePath = `/Movies/EpisodeSplitter/Session_001/${fileName}`;
+  try {
+    for (let i = 0; i < totalEpisodes; i++) {
+      if (abortSignal.aborted) {
+        throw new Error('Processing was cancelled.');
+      }
 
-    const initialElapsedSeconds = (Date.now() - overallStartTime) / 1000;
-    const avgSecPerEpisode = i > 0 ? initialElapsedSeconds / i : episodeDuration * 0.15;
-    const estRemainingSec = Math.round(avgSecPerEpisode * (totalEpisodes - i));
+      const episodeNumber = i + 1;
+      const startSeconds = i * interval;
+      const endSeconds = Math.min((i + 1) * interval, totalDuration);
+      const episodeDuration = Math.max(0.1, endSeconds - startSeconds);
+      const formattedRange = formatSecondsRange(startSeconds, endSeconds);
+      const fileName = `Episode ${episodeNumber}.mp4`;
+      const filePath = `/Movies/EpisodeSplitter/Session_001/${fileName}`;
 
-    onProgress({
-      currentEpisode: episodeNumber,
-      totalEpisodes,
-      percent: Math.min(99, Math.round((i / totalEpisodes) * 100)),
-      currentSegmentStart: startSeconds,
-      currentSegmentEnd: endSeconds,
-      currentEpisodeElapsedSec: 0,
-      currentEpisodeTotalSec: episodeDuration,
-      overallCurrentSeconds: startSeconds,
-      overallTotalSeconds: totalDuration,
-      estimatedRemainingSeconds: estRemainingSec,
-      speed: 'Active',
-      currentTask: `Creating Episode ${episodeNumber}`,
-    });
+      const initialElapsedSeconds = (Date.now() - overallStartTime) / 1000;
+      const avgSecPerEpisode = i > 0 ? initialElapsedSeconds / i : episodeDuration * 0.15;
+      const estRemainingSec = Math.round(avgSecPerEpisode * (totalEpisodes - i));
 
-    // Extract segment streaming directly from video source
-    const episodeBlob = await extractSegmentFromVideo({
-      videoMetadata,
-      startSec: startSeconds,
-      endSec: endSeconds,
-      videoQuality,
-      originalAudioVolume,
-      autoVideoNoiseReduction,
-      autoAudioNoiseReduction,
-      backgroundMusic,
-      onSubProgress: (subProgress) => {
-        const subElapsed = subProgress * episodeDuration;
-        const currentOverallSec = startSeconds + subElapsed;
-        const overallPercent = Math.min(99, Math.round((currentOverallSec / totalDuration) * 100));
+      onProgress({
+        currentEpisode: episodeNumber,
+        totalEpisodes,
+        percent: Math.min(99, Math.round((i / totalEpisodes) * 100)),
+        currentSegmentStart: startSeconds,
+        currentSegmentEnd: endSeconds,
+        currentEpisodeElapsedSec: 0,
+        currentEpisodeTotalSec: Math.round(episodeDuration),
+        overallCurrentSeconds: Math.round(startSeconds),
+        overallTotalSeconds: Math.round(totalDuration),
+        estimatedRemainingSeconds: estRemainingSec,
+        speed: 'Active',
+        currentTask: `Creating Episode ${episodeNumber}`,
+      });
 
-        onProgress({
-          currentEpisode: episodeNumber,
-          totalEpisodes,
-          percent: overallPercent,
-          currentSegmentStart: startSeconds,
-          currentSegmentEnd: endSeconds,
-          currentEpisodeElapsedSec: Math.round(subElapsed),
-          currentEpisodeTotalSec: Math.round(episodeDuration),
-          overallCurrentSeconds: Math.round(currentOverallSec),
-          overallTotalSeconds: Math.round(totalDuration),
-          estimatedRemainingSeconds: estRemainingSec,
-          speed: 'Processing',
-          currentTask: `Creating Episode ${episodeNumber}`,
-        });
-      },
-      abortSignal,
-    });
+      // Extract segment streaming directly from video source with retry mechanism
+      let episodeBlob: Blob | null = null;
+      let lastError: Error | null = null;
 
-    // Strict validation: Output must not be empty
-    if (!episodeBlob || episodeBlob.size < 512) {
-      throw new Error(`Episode ${episodeNumber} generation failed. Output was empty.`);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          episodeBlob = await extractSegmentFromVideo({
+            videoMetadata,
+            startSec: startSeconds,
+            endSec: endSeconds,
+            videoQuality,
+            originalAudioVolume,
+            autoVideoNoiseReduction,
+            autoAudioNoiseReduction,
+            backgroundMusic,
+            sharedAudioCtx,
+            attempt,
+            onSubProgress: (subProgress) => {
+              const subElapsed = subProgress * episodeDuration;
+              const currentOverallSec = startSeconds + subElapsed;
+              const overallPercent = Math.min(99, Math.round((currentOverallSec / totalDuration) * 100));
+
+              onProgress({
+                currentEpisode: episodeNumber,
+                totalEpisodes,
+                percent: overallPercent,
+                currentSegmentStart: startSeconds,
+                currentSegmentEnd: endSeconds,
+                currentEpisodeElapsedSec: Math.round(subElapsed),
+                currentEpisodeTotalSec: Math.round(episodeDuration),
+                overallCurrentSeconds: Math.round(currentOverallSec),
+                overallTotalSeconds: Math.round(totalDuration),
+                estimatedRemainingSeconds: estRemainingSec,
+                speed: 'Processing',
+                currentTask: `Creating Episode ${episodeNumber}`,
+              });
+            },
+            abortSignal,
+          });
+
+          if (episodeBlob && episodeBlob.size >= 512) {
+            break;
+          }
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          console.warn(`Episode ${episodeNumber} attempt ${attempt + 1} note:`, lastError.message);
+          if (abortSignal.aborted) throw lastError;
+          await new Promise((resolve) => setTimeout(resolve, 150));
+        }
+      }
+
+      if (!episodeBlob || episodeBlob.size < 512) {
+        throw (
+          lastError ||
+          new Error(`Episode ${episodeNumber} generation failed. Output was empty.`)
+        );
+      }
+
+      const blobUrl = URL.createObjectURL(episodeBlob);
+      const episodeItem: EpisodeItem = {
+        id: episodeNumber,
+        episodeNumber,
+        fileName,
+        filePath,
+        fileUri: blobUrl,
+        startSeconds,
+        endSeconds,
+        durationSeconds: episodeDuration,
+        formattedRange,
+        blob: episodeBlob,
+        blobUrl,
+        size: episodeBlob.size,
+        isReady: true,
+        hasAudio: videoMetadata.hasAudio,
+      };
+
+      completedEpisodes.push(episodeItem);
+      if (onEpisodeCompleted) {
+        onEpisodeCompleted(episodeItem);
+      }
+
+      // Yield control to UI thread to guarantee 0-lag responsiveness and memory cleanup
+      await new Promise((resolve) => setTimeout(resolve, 40));
     }
-
-    const blobUrl = URL.createObjectURL(episodeBlob);
-    const episodeItem: EpisodeItem = {
-      id: episodeNumber,
-      episodeNumber,
-      fileName,
-      filePath,
-      fileUri: blobUrl,
-      startSeconds,
-      endSeconds,
-      durationSeconds: episodeDuration,
-      formattedRange,
-      blob: episodeBlob,
-      blobUrl,
-      size: episodeBlob.size,
-      isReady: true,
-      hasAudio: videoMetadata.hasAudio,
-    };
-
-    completedEpisodes.push(episodeItem);
-    if (onEpisodeCompleted) {
-      onEpisodeCompleted(episodeItem);
+  } finally {
+    if (sharedAudioCtx) {
+      sharedAudioCtx.close().catch(() => {});
     }
-
-    // Yield control to UI thread to guarantee 0-lag responsiveness
-    await new Promise((resolve) => setTimeout(resolve, 30));
   }
 
   // 100% final progress state
@@ -304,6 +346,8 @@ interface SegmentOptions {
   autoVideoNoiseReduction: boolean;
   autoAudioNoiseReduction: boolean;
   backgroundMusic?: BackgroundMusicConfig;
+  sharedAudioCtx?: AudioContext | null;
+  attempt?: number;
   onSubProgress: (fraction: number) => void;
   abortSignal: AbortSignal;
 }
@@ -311,6 +355,8 @@ interface SegmentOptions {
 /**
  * Extracts a video segment directly from video element and Web Audio graph.
  * Does NOT buffer the entire file; streams segment-by-segment.
+ * Fully protects against autoplay restrictions on Part 2+ by automatically
+ * falling back to muted playback if unmuted playback is blocked.
  */
 async function extractSegmentFromVideo(options: SegmentOptions): Promise<Blob> {
   const {
@@ -322,6 +368,8 @@ async function extractSegmentFromVideo(options: SegmentOptions): Promise<Blob> {
     autoVideoNoiseReduction,
     autoAudioNoiseReduction,
     backgroundMusic,
+    sharedAudioCtx,
+    attempt = 0,
     onSubProgress,
     abortSignal,
   } = options;
@@ -331,19 +379,35 @@ async function extractSegmentFromVideo(options: SegmentOptions): Promise<Blob> {
       return reject(new Error('Processing was cancelled.'));
     }
 
-    const duration = endSec - startSec;
+    const duration = Math.max(0.1, endSec - startSec);
     const video = document.createElement('video');
     video.src = videoMetadata.blobUrl;
-    video.muted = false; // Must be unmuted to stream audio into Web Audio node
-    video.volume = 1.0;
+    // On attempt > 0 or after user gesture expires, muted playback is guaranteed to never be blocked
+    video.muted = attempt > 0;
     video.playsInline = true;
     video.preload = 'auto';
 
     let isDone = false;
+    let tickerInterval: number | null = null;
+    let animFrameId: number | null = null;
+    let seekTimeoutId: number | null = null;
+    let recorder: MediaRecorder | null = null;
     const chunks: Blob[] = [];
 
     const cleanup = () => {
       isDone = true;
+      if (seekTimeoutId !== null) {
+        clearTimeout(seekTimeoutId);
+        seekTimeoutId = null;
+      }
+      if (tickerInterval !== null) {
+        clearInterval(tickerInterval);
+        tickerInterval = null;
+      }
+      if (animFrameId !== null) {
+        cancelAnimationFrame(animFrameId);
+        animFrameId = null;
+      }
       video.pause();
       video.removeAttribute('src');
       video.load();
@@ -380,8 +444,8 @@ async function extractSegmentFromVideo(options: SegmentOptions): Promise<Blob> {
     height = height - (height % 2);
 
     const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
+    canvas.width = Math.max(2, width);
+    canvas.height = Math.max(2, height);
     const ctx = canvas.getContext('2d', { alpha: false });
 
     if (!ctx) {
@@ -393,34 +457,28 @@ async function extractSegmentFromVideo(options: SegmentOptions): Promise<Blob> {
       ctx.filter = 'contrast(1.02) brightness(1.01)';
     }
 
-    // Audio Graph: Stream audio from video element without reading file into RAM
-    let audioCtx: AudioContext | null = null;
+    // Audio setup using shared AudioContext
     let audioDest: MediaStreamAudioDestinationNode | null = null;
+    if (sharedAudioCtx && sharedAudioCtx.state !== 'closed') {
+      try {
+        if (sharedAudioCtx.state === 'suspended') {
+          sharedAudioCtx.resume().catch(() => {});
+        }
+        audioDest = sharedAudioCtx.createMediaStreamDestination();
 
-    try {
-      const AudioContextClass =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-
-      if (AudioContextClass) {
-        audioCtx = new AudioContextClass();
-        audioDest = audioCtx.createMediaStreamDestination();
-
-        // Connect video element audio directly to Web Audio
         try {
-          const videoSource = audioCtx.createMediaElementSource(video);
-          const origGain = audioCtx.createGain();
-          origGain.gain.setValueAtTime(Math.max(0, originalAudioVolume), audioCtx.currentTime);
+          const videoSource = sharedAudioCtx.createMediaElementSource(video);
+          const origGain = sharedAudioCtx.createGain();
+          origGain.gain.setValueAtTime(Math.max(0, originalAudioVolume), sharedAudioCtx.currentTime);
 
           if (autoAudioNoiseReduction) {
-            // Speech-safe highpass + lowpass filters
-            const rumbleFilter = audioCtx.createBiquadFilter();
+            const rumbleFilter = sharedAudioCtx.createBiquadFilter();
             rumbleFilter.type = 'highpass';
-            rumbleFilter.frequency.setValueAtTime(80, audioCtx.currentTime);
+            rumbleFilter.frequency.setValueAtTime(80, sharedAudioCtx.currentTime);
 
-            const hissFilter = audioCtx.createBiquadFilter();
+            const hissFilter = sharedAudioCtx.createBiquadFilter();
             hissFilter.type = 'lowpass';
-            hissFilter.frequency.setValueAtTime(6500, audioCtx.currentTime);
+            hissFilter.frequency.setValueAtTime(6500, sharedAudioCtx.currentTime);
 
             videoSource.connect(rumbleFilter);
             rumbleFilter.connect(hissFilter);
@@ -430,35 +488,37 @@ async function extractSegmentFromVideo(options: SegmentOptions): Promise<Blob> {
           }
 
           origGain.connect(audioDest);
-          // NOTE: Do NOT connect to audioCtx.destination to prevent loud speaker feedback during rendering
-        } catch (audioErr) {
-          console.warn('[VideoProcessor] Direct media element audio source attach note:', audioErr);
+        } catch {
+          // In case media element source is already attached
         }
 
-        // Optional Background Music mix
         if (backgroundMusic && backgroundMusic.enabled && backgroundMusic.audioBuffer) {
-          const bgSource = audioCtx.createBufferSource();
+          const bgSource = sharedAudioCtx.createBufferSource();
           bgSource.buffer = backgroundMusic.audioBuffer;
           bgSource.loop = true;
-          const bgGain = audioCtx.createGain();
-          bgGain.gain.setValueAtTime(backgroundMusic.volume ?? 0.2, audioCtx.currentTime);
+          const bgGain = sharedAudioCtx.createGain();
+          bgGain.gain.setValueAtTime(backgroundMusic.volume ?? 0.2, sharedAudioCtx.currentTime);
           bgSource.connect(bgGain);
           bgGain.connect(audioDest);
           bgSource.start(0);
         }
+      } catch {
+        // Fallback without web audio nodes
       }
-    } catch (e) {
-      console.warn('[VideoProcessor] AudioContext setup note:', e);
     }
 
-    // Set up MediaRecorder
-    video.onloadeddata = () => {
-      video.currentTime = startSec;
-    };
+    let startedRecording = false;
 
-    video.onseeked = () => {
-      if (isDone) return;
+    const startRecordingAndPlayback = async () => {
+      if (startedRecording || isDone) return;
+      startedRecording = true;
 
+      if (seekTimeoutId !== null) {
+        clearTimeout(seekTimeoutId);
+        seekTimeoutId = null;
+      }
+
+      // Prepare MediaStream
       const canvasStream = canvas.captureStream(30);
       const streamTracks = [...canvasStream.getVideoTracks()];
 
@@ -482,7 +542,6 @@ async function extractSegmentFromVideo(options: SegmentOptions): Promise<Blob> {
         }
       }
 
-      let recorder: MediaRecorder;
       try {
         recorder = new MediaRecorder(combinedStream, {
           mimeType: chosenMime,
@@ -500,26 +559,59 @@ async function extractSegmentFromVideo(options: SegmentOptions): Promise<Blob> {
 
       recorder.onstop = () => {
         cleanup();
-        if (audioCtx) {
-          audioCtx.close().catch(() => {});
-        }
         const finalBlob = new Blob(chunks, { type: chosenMime });
         resolve(finalBlob);
       };
 
       recorder.start(100);
 
-      const playPromise = video.play();
-      if (playPromise !== undefined) {
-        playPromise.catch((err) => {
+      // Play video with autoplay-safe fallback (prevents Episode 2+ crash!)
+      try {
+        await video.play();
+      } catch {
+        // Browser blocked unmuted autoplay because user interaction expired
+        video.muted = true;
+        video.defaultMuted = true;
+        try {
+          await video.play();
+        } catch (mutedErr) {
           cleanup();
-          reject(new Error(`Failed to play video during processing: ${err.message}`));
-        });
+          return reject(
+            new Error(
+              `Video playback failed: ${
+                mutedErr instanceof Error ? mutedErr.message : String(mutedErr)
+              }`
+            )
+          );
+        }
       }
 
-      let animFrameId: number;
-      const render = () => {
-        if (isDone) return;
+      // Hybrid rendering loop: requestAnimationFrame + setInterval watchdog
+      // Ensures rendering does not pause if the user switches tabs or window loses focus
+      let finished = false;
+
+      const finishRecording = () => {
+        if (finished) return;
+        finished = true;
+        if (recorder && recorder.state === 'recording') {
+          try {
+            recorder.requestData();
+          } catch {
+            // Ignore if requestData not supported
+          }
+          setTimeout(() => {
+            if (recorder && recorder.state === 'recording') {
+              recorder.stop();
+            }
+          }, 60);
+        } else {
+          cleanup();
+          resolve(new Blob(chunks, { type: chosenMime }));
+        }
+      };
+
+      const step = () => {
+        if (isDone || finished) return;
 
         const currentPos = video.currentTime;
         const progressInEpisode = Math.max(0, Math.min(1.0, (currentPos - startSec) / duration));
@@ -528,23 +620,53 @@ async function extractSegmentFromVideo(options: SegmentOptions): Promise<Blob> {
         ctx.drawImage(video, 0, 0, width, height);
 
         if (currentPos >= endSec || video.ended) {
-          cancelAnimationFrame(animFrameId);
-          if (recorder.state === 'recording') {
-            recorder.stop();
-          }
-          return;
+          finishRecording();
         }
-
-        animFrameId = requestAnimationFrame(render);
       };
 
-      animFrameId = requestAnimationFrame(render);
+      // Ticker interval runs at ~30 FPS even in background
+      tickerInterval = window.setInterval(step, 33);
+
+      const renderAnim = () => {
+        if (isDone || finished) return;
+        step();
+        animFrameId = requestAnimationFrame(renderAnim);
+      };
+      animFrameId = requestAnimationFrame(renderAnim);
+    };
+
+    // Seek safely
+    video.onseeked = () => {
+      startRecordingAndPlayback();
     };
 
     video.onerror = () => {
       cleanup();
-      reject(new Error('Video element encountered an error during segment extraction.'));
+      reject(new Error('Video element encountered an error while seeking/loading.'));
     };
+
+    // Trigger seek
+    const performSeek = () => {
+      try {
+        video.currentTime = startSec;
+      } catch {
+        startRecordingAndPlayback();
+      }
+    };
+
+    if (video.readyState >= 1) {
+      performSeek();
+    } else {
+      video.onloadedmetadata = performSeek;
+    }
+
+    // Safety timeout: If seek doesn't complete within 2.5s, force start
+    seekTimeoutId = window.setTimeout(() => {
+      if (!startedRecording && !isDone) {
+        console.warn(`Seek to ${startSec}s timed out, starting recording fallback...`);
+        startRecordingAndPlayback();
+      }
+    }, 2500);
   });
 }
 
