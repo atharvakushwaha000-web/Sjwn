@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<workflow name="Build and Publish Debug APK">
+    <triggers>
+        <trigger type="push">
+            <branch>main</branch>
+        </trigger>
+        <trigger type="workflow_dispatch"/>
+    </triggers>
+    <permissions>
+        <permission name="contents">write</permission>
+    </permissions>
+    <environment>
+        <os>ubuntu-latest</os>
+        <java version="17" distribution="temurin"/>
+        <gradle version="9.3.1"/>
+    </environment>
+    <steps>
+        <step id="checkout" name="Checkout repository" action="actions/checkout@v4"/>
+        <step id="setup-java" name="Set up Java 17 (Temurin)" action="actions/setup-java@v4"/>
+        <step id="verify-java" name="Verify Java environment"/>
+        <step id="setup-gradle" name="Set up Gradle 9.3.1" action="gradle/actions/setup-gradle@v4"/>
+        <step id="prepare-project" name="Prepare Android project layout"/>
+        <step id="create-keystore" name="Create temporary debug keystore"/>
+        <step id="build-apk" name="Build Debug APK">
+            <command>gradle :app:assembleDebug --stacktrace --no-daemon</command>
+        </step>
+        <step id="verify-apk" name="Verify APK">
+            <path>app/build/outputs/apk/debug/app-debug.apk</path>
+        </step>
+        <step id="upload-artifact" name="Upload debug APK artifact" action="actions/upload-artifact@v4">
+            <artifact-name>app-debug-apk</artifact-name>
+            <path>app/build/outputs/apk/debug/app-debug.apk</path>
+        </step>
+        <step id="prepare-release-asset" name="Prepare APK release asset"/>
+        <step id="publish-release" name="Publish APK to GitHub Releases">
+            <cli>gh release create</cli>
+            <latest>true</latest>
+            <tag-format>debug-apk-build-${run_number}-${run_attempt}</tag-format>
+        </step>
+        <step id="report-result" name="Report APK download result"/>
+    </steps>
+</workflow>

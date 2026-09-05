@@ -1,0 +1,7 @@
+{
+  "name": "Episode Splitter",
+  "description": "Production-quality Android application that automatically splits any video into equal-duration clips, with in-app preview, ZIP export, and native Kotlin source code.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
